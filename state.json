@@ -1,0 +1,12 @@
+{
+  "cash": 10,
+  "sol": 0,
+  "reference_price": null,
+  "entry_price": null,
+  "started_at": null,
+  "day": null,
+  "day_start_equity": 10,
+  "trades": [],
+  "last_scan": null,
+  "finished": false
+}
