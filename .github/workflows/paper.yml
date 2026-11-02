@@ -1,250 +1,29 @@
-__pycache__/
-*.pyc
-.env
-*.key
-secrets.json
-
-#!/usr/bin/env python3
-"""Solana altcoin paper trading; no private keys, no orders. Python stdlib only."""
-import json, os, math, time, urllib.request, urllib.error
-from pathlib import Path
-from datetime import datetime, timezone
-
-ROOT=Path(__file__).resolve().parent
-STATE=ROOT/'state.json'
-REPORT=ROOT/'REPORT.md'
-START=10.0
-SESSION_HOURS=7
-TRADE_USD=3.0
-MAX_POSITIONS=1
-DAILY_LOSS=1.0
-TAKE_PROFIT=0.12
-STOP_LOSS=0.08
-TRAILING_STOP=0.10
-ROUNDTRIP_SIDE_FEE=0.003  # illustrative swap fee per side
-NETWORK_FEE_USD=0.01  # illustrative network/priority fee per transaction
-MAX_SLIPPAGE=0.025
-MIN_LIQUIDITY=50000
-MIN_VOL_H1=10000
-MIN_MARKET_CAP=100000
-MAX_MARKET_CAP=200000000
-MAX_H1_CHANGE=100
-MAX_CANDIDATES=14
-HEADERS={'User-Agent':'solana-paper-bot2/1.0 (educational simulation)','Accept':'application/json'}
-
-def request_json(url):
-    req=urllib.request.Request(url,headers=HEADERS)
-    with urllib.request.urlopen(req,timeout=18) as resp:
-        return json.load(resp)
-
-def number(value,default=0.0):
-    try:
-        n=float(value)
-        return n if math.isfinite(n) else default
-    except (TypeError,ValueError):
-        return default
-
-def initial(now):
-    return {'cash':START,'position':None,'started_at':now.isoformat(),'day':now.date().isoformat(),
-            'day_start_equity':START,'trades':[],'last_scan':None,'last_error':None,'finished':False}
-
-def load_state(now):
-    if not STATE.exists(): return initial(now)
-    s=json.loads(STATE.read_text(encoding='utf-8'))
-    for k in ('cash','position','started_at','day','day_start_equity','trades','finished'):
-        if k not in s: raise ValueError('Missing state field: '+k)
-    return s
-
-def scan():
-    """DexScreener boosted token list is a discovery source, NOT a verified signal."""
-    boosts=request_json('https://api.dexscreener.com/token-boosts/top/v1')
-    if not isinstance(boosts,list): raise ValueError('Unexpected token discovery response')
-    addresses=[]
-    for item in boosts:
-        if item.get('chainId')=='solana':
-            addr=item.get('tokenAddress','')
-            if addr and addr not in addresses: addresses.append(addr)
-        if len(addresses)>=MAX_CANDIDATES: break
-    candidates=[]
-    for addr in addresses:
-        try:
-            pairs=request_json('https://api.dexscreener.com/token-pairs/v1/solana/'+addr)
-            if not isinstance(pairs,list): continue
-            valid=[p for p in pairs if p.get('chainId')=='solana' and number((p.get('liquidity') or {}).get('usd'))>0]
-            if not valid: continue
-            p=max(valid,key=lambda x:number((x.get('liquidity') or {}).get('usd')))
-            liq=number((p.get('liquidity') or {}).get('usd'))
-            vol=number((p.get('volume') or {}).get('h1'))
-            cap=number(p.get('marketCap') or p.get('fdv'))
-            price=number(p.get('priceUsd'))
-            change=number((p.get('priceChange') or {}).get('h1'))
-            tx=(p.get('txns') or {}).get('h1') or {}
-            buys=number(tx.get('buys')); sells=number(tx.get('sells'))
-            if not (price>0 and liq>=MIN_LIQUIDITY and vol>=MIN_VOL_H1 and MIN_MARKET_CAP<=cap<=MAX_MARKET_CAP and -50<=change<=MAX_H1_CHANGE and buys+sells>=20): continue
-            # Penalize extreme pumps; boosts are paid promotion and can be manipulated.
-            score=math.log10(1+vol)+0.5*math.log10(1+liq)+min(3,max(-3,change/10))+min(1,buys/max(1,buys+sells))-max(0,change-35)/10
-            candidates.append({'address':addr,'symbol':(p.get('baseToken') or {}).get('symbol','?')[:20],
-                'price':price,'liquidity':liq,'volume_h1':vol,'market_cap':cap,'change_h1':change,
-                'pair':p.get('pairAddress',''),'score':round(score,3)})
-        except (urllib.error.URLError,TimeoutError,ValueError,KeyError,TypeError):
-            continue
-    return sorted(candidates,key=lambda x:x['score'],reverse=True)
-
-def slip_fraction(trade_usd,liquidity):
-    # Conservative toy approximation, not a real AMM route quote.
-    return min(1.0,0.005+trade_usd/max(1,liquidity))
-
-def equity(state,prices):
-    pos=state['position']
-    if not pos: return state['cash']
-    return state['cash']+pos['qty']*prices.get(pos['address'],pos['last_price'])
-
-def execute_buy(state,token,now):
-    slippage=slip_fraction(TRADE_USD,token['liquidity'])
-    if slippage>MAX_SLIPPAGE or state['cash']<TRADE_USD+NETWORK_FEE_USD: return False
-    # Cash debit includes transaction fee; position qty includes estimated swap and slippage.
-    qty=TRADE_USD*(1-ROUNDTRIP_SIDE_FEE)*(1-slippage)/token['price']
-    state['cash']=round(state['cash']-TRADE_USD-NETWORK_FEE_USD,8)
-    state['position']={'address':token['address'],'symbol':token['symbol'],'qty':qty,
-        'entry_price':token['price'],'last_price':token['price'],'high_price':token['price'],
-        'liquidity':token['liquidity'],'opened_at':now.isoformat()}
-    state['trades'].append({'at':now.isoformat(),'side':'BUY','symbol':token['symbol'],'price':token['price'],
-        'gross_usd':TRADE_USD,'slippage_est':slippage,'fee_rate':ROUNDTRIP_SIDE_FEE,'network_fee_usd':NETWORK_FEE_USD})
-    return True
-
-def execute_sell(state,price,liquidity,now,reason):
-    pos=state['position']; gross=pos['qty']*price
-    slip=slip_fraction(gross,liquidity)
-    if slip>MAX_SLIPPAGE: return False
-    proceeds=max(0,gross*(1-ROUNDTRIP_SIDE_FEE)*(1-slip)-NETWORK_FEE_USD)
-    state['cash']=round(state['cash']+proceeds,8)
-    state['trades'].append({'at':now.isoformat(),'side':'SELL','symbol':pos['symbol'],'price':price,
-        'gross_usd':gross,'net_usd':proceeds,'reason':reason,'slippage_est':slip})
-    state['position']=None
-    return True
-
-def write_report(state,candidates,now,status):
-    prices={x['address']:x['price'] for x in candidates}
-    eq=equity(state,prices)
-    lines=['# Solana Paper Bot — Simülasyon Raporu','',f'**Son kontrol (UTC):** {now.isoformat()}',
-      f'**Durum:** {status}',f'**Sanal nakit:** \\${state["cash"]:.4f}',
-      f'**Tahmini portföy:** \\${eq:.4f}',f'**Başlangıca göre:** {eq-START:+.4f} USD',
-      f'**Pozisyon:** {state["position"]["symbol"] if state["position"] else "Yok"}',
-      f'**İşlem sayısı:** {len(state["trades"])}','',
-      '## Son taramada uygun bulunan tokenlar','',
-      '| Token | 1s % | 1s Hacim ($) | Likidite ($) | Piyasa değeri ($) |',
-      '|---|---:|---:|---:|---:|']
-    for c in candidates[:8]: lines.append(f'| {c["symbol"]} | {c["change_h1"]:+.1f} | {c["volume_h1"]:,.0f} | {c["liquidity"]:,.0f} | {c["market_cap"]:,.0f} |')
-    if not candidates: lines.append('| Uygun aday bulunamadı | | | | |')
-    lines+=['','## Son işlemler','','| UTC | Yön | Token | Fiyat ($) | Not |','|---|---|---|---:|---|']
-    for t in state['trades'][-15:][::-1]: lines.append(f'| {t["at"]} | {t["side"]} | {t["symbol"]} | {t["price"]:.9g} | {t.get("reason", "simülasyon")} |')
-    lines+=['','> Yalnızca eğitim amaçlı sanal işlemler. DexScreener boost listesi ücretli tanıtım içerir; sözleşme, holder, honeypot, sosyal medya ve fiyat kotasyonu doğrulaması yapılmaz. Ücret/kayma varsayımsaldır. Zamanlanmış kontroller gecikebilir.']
-    REPORT.write_text('\n'.join(lines)+'\n',encoding='utf-8')
-
-def main():
-    now=datetime.now(timezone.utc)
-    s=load_state(now)
-    if s['finished']:
-        print('Session finished; no new trades. Reset state.json to start a new experiment.')
-        return
-    if not s['started_at']:
-        s['started_at']=now.isoformat()
-    start=datetime.fromisoformat(s['started_at'])
-    expired=(now-start).total_seconds()>=SESSION_HOURS*3600
-    candidates=[]; status='OK'
-    try:
-        candidates=scan()
-    except (urllib.error.URLError,TimeoutError,ValueError,TypeError) as e:
-        status='DATA_ERROR: '+str(e)[:100]
-        s['last_error']=status
-    prices={x['address']:x['price'] for x in candidates}
-    pos=s['position']
-    if pos:
-        match=next((c for c in candidates if c['address']==pos['address']),None)
-        if not match:
-            try:
-                pairs=request_json('https://api.dexscreener.com/token-pairs/v1/solana/'+pos['address'])
-                valid=[p for p in pairs if p.get('chainId')=='solana' and number((p.get('liquidity') or {}).get('usd'))>0]
-                if valid:
-                    p=max(valid,key=lambda x:number((x.get('liquidity') or {}).get('usd')))
-                    match={'address':pos['address'],'price':number(p.get('priceUsd')),'liquidity':number((p.get('liquidity') or {}).get('usd'))}
-            except (urllib.error.URLError,TimeoutError,ValueError,TypeError): pass
-        if match and match['price']>0:
-            pos['last_price']=match['price']; pos['high_price']=max(pos['high_price'],match['price'])
-            pos['liquidity']=match['liquidity']; prices[pos['address']]=match['price']
-        else: status='POSITION_PRICE_UNAVAILABLE: no sale assumed'
-    eq=equity(s,prices)
-    if s['day']!=now.date().isoformat():
-        s['day']=now.date().isoformat();s['day_start_equity']=eq
-    locked=eq<=s['day_start_equity']-DAILY_LOSS
-    if s['position'] and s['position']['address'] in prices:
-        pos=s['position']; price=prices[pos['address']]
-        reason=None
-        if expired: reason='SESSION_END'
-        elif price>=pos['entry_price']*(1+TAKE_PROFIT): reason='TAKE_PROFIT'
-        elif price<=pos['entry_price']*(1-STOP_LOSS): reason='STOP_LOSS'
-        elif price<=pos['high_price']*(1-TRAILING_STOP): reason='TRAILING_STOP'
-        elif locked: reason='DAILY_LOSS'
-        if reason and not execute_sell(s,price,pos['liquidity'],now,reason): status='SELL_BLOCKED_SLIPPAGE'
-    if expired:
-        if not s['position']: s['finished']=True;status='FINISHED'
-        else: status='SESSION_EXPIRED_POSITION_UNSOLD'
-    elif not s['position'] and not locked and candidates and status=='OK':
-        if execute_buy(s,candidates[0],now): status='SIMULATED_BUY'
-    elif locked: status='DAILY_LOSS_LOCK'
-    s['last_scan']=now.isoformat()
-    STATE.write_text(json.dumps(s,indent=2,ensure_ascii=False)+'\n',encoding='utf-8')
-    write_report(s,candidates,now,status)
-    print(json.dumps({'status':status,'equity_usd':round(equity(s,prices),4),'cash_usd':s['cash'],
-      'position':s['position']['symbol'] if s['position'] else None,'candidates':len(candidates),
-      'finished':s['finished']},indent=2))
-
-if __name__=='__main__': main()
-
-# Solana Paper Bot 2 — 10 USD, 7 saatlik simülasyon
-
-**Gerçek alım satım yapmaz.** Trust Wallet bağlantısı, özel anahtar, seed phrase, RPC imzası veya gerçek DEX emri içermez.
-
-## iPhone ile kurulum
-
-1. Bu ZIP dosyasını iPhone **Dosyalar** uygulamasında açın.
-2. Safari'den GitHub'daki `solana-paper-bot2` deponuza girin.
-3. `bot.py`, `state.json`, `README.md` dosyalarını depo köküne yükleyin. `REPORT.md` bot tarafından üretilir.
-4. GitHub'da **Add file > Create new file** seçin ve dosya adı olarak **`.github/workflows/paper.yml`** yazın. ZIP içindeki aynı adlı dosyanın metnini yapıştırın ve commit edin. Alternatif olarak bilgisayardan klasör yapısını koruyarak yükleyin.
-5. **Settings > Actions > General > Workflow permissions** bölümünde **Read and write permissions** seçin (kurum politikası izin veriyorsa). GitHub Actions'ı etkinleştirin.
-6. **Actions > Solana Paper Bot > Run workflow** seçin. İlk çalıştırmadan sonra `REPORT.md` ve `state.json` dosyalarını açarak sonucu izleyin.
-7. Bot 15 dakikada bir *denemeye* programlanmıştır. GitHub zamanlaması gecikebilir/atlanabilir. Telefonun açık kalması gerekmez.
-
-**ÖNEMLİ:** `state.json` içindeki `started_at` alanı örnek tarih içerir. **İlk çalıştırmadan önce** bunu güncel UTC zamanına (ör. `2026-11-02T17:30:00+00:00`) ayarlayın; aksi halde bot oturumu sona ermiş sayar. İsterseniz `started_at` değerini `null` yapın: bot ilk çalıştırmada başlangıç zamanını kendisi atayacak şekilde düzenlenmiştir.
-
-## Strateji ve sınırlar
-
-- Başlangıç: 10 USD sanal nakit. 7 saatlik oturum.
-- DexScreener'ın Solana **boosted** tokenları üzerinden en fazla 14 aday taranır. **Bu liste sponsorlu tanıtımdır, organik trend veya güvenilirlik doğrulaması değildir.**
-- Filtreler: en az 50 bin USD likidite, 10 bin USD 1 saatlik hacim, 100 bin–200 milyon USD market cap, en az 20 saatlik işlem.
-- Tek pozisyon, işlem başına 3 USD sanal tutar. Kâr al +%12, zarar kes -%8, trailing stop -%10, günlük 1 USD kayıp kilidi.
-- Varsayımsal maliyet: her yönde %0,3 işlem ücreti + 0,01 USD ağ ücreti + yaklaşık %0,5 kayma. Gerçek havuz ücretleri, token vergileri, MEV ve gerçek kayma farklı olabilir.
-- Oturum sonunda pozisyon kapatılmaya çalışılır. Veri eksikse veya kayma sınırı aşılırsa satış yapılmış gibi gösterilmez.
-
-## Sınırlamalar
-
-- X, Telegram, holder yoğunlaşması, kontrat güvenliği, honeypot, honeypot satış testi, honeypot vergisi ve audit **kontrol edilmiyor**.
-- API erişimi, ücretli tanıtım manipülasyonu ve zamanlanmış çalıştırma gecikmeleri sonucu bozabilir.
-- Simülasyonun performansı gerçek piyasada gerçekleşebilir bir getiri değildir. Sermayenin tamamı kaybedilebilir.
-- Bot, GitHub deposuna simülasyon durumu ve rapor yazar. Depo **Public** ise bunlar herkese görünür; hiçbir gizli bilgi yüklemeyin.
-
-## Yeni simülasyon başlatma
-
-`state.json` içindeki bakiyeyi 10'a, pozisyonu `null`a, işlemleri boş listeye, `finished` değerini `false`a ve `started_at` değerini `null`a çevirin. Ardından `Run workflow` kullanın.
-
-{
-  "cash": 10.0,
-  "position": null,
-  "started_at": null,
-  "day": "2026-11-02",
-  "day_start_equity": 10.0,
-  "trades": [],
-  "last_scan": null,
-  "last_error": null,
-  "finished": false
-}
+name: Solana Paper Bot
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 */2 * * *'
+permissions:
+  contents: write
+concurrency:
+  group: solana-paper
+  cancel-in-progress: false
+jobs:
+  paper:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run simulation
+        run: python bot.py
+      - name: Save state
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add state.json REPORT.md
+          if ! git diff --cached --quiet; then
+            git commit -m "Update paper trading report"
+            git push
+          fi
