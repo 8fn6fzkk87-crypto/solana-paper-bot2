@@ -1,12 +1,12 @@
 {
   "cash": 10.0,
   "sol": 0.0,
-  "reference_price": 71.23,
+  "reference_price": 72.09,
   "entry_price": null,
   "started_at": "2026-11-02T18:50:17.735208+00:00",
   "day": "2026-11-15",
   "day_start_equity": 10.0,
   "trades": [],
-  "last_scan": "2026-11-15T09:04:16.374092+00:00",
+  "last_scan": "2026-11-15T10:59:17.812966+00:00",
   "finished": true
 }
