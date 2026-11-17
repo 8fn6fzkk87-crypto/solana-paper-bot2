@@ -1,9 +1,9 @@
 # Solana paper trading report
 
-Updated (UTC): 2026-11-17T13:31:44.765383+00:00
+Updated (UTC): 2026-11-17T15:10:39.179584+00:00
 Session finished: True
 Decision: HOLD
-SOL price: $73.9700
+SOL price: $73.0500
 Cash: $10.0000
 SOL (simulated): 0.00000000
 Equity: $10.0000
